@@ -433,6 +433,7 @@ Resources:
                   - sqs:DeleteMessage
                   - sqs:GetQueueAttributes
                   - sqs:SendMessage
+                  - sqs:PurgeQueue
                 Resource: !GetAtt SyncEventQueue.Arn
 
   # Lambda Function for Auto-Sync
@@ -446,6 +447,7 @@ Resources:
       Handler: index.lambda_handler
       Timeout: 60
       Role: !GetAtt AutoSyncLambdaRole.Arn
+      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           KNOWLEDGE_BASE_ID: !Ref KnowledgeBase
@@ -531,7 +533,32 @@ Resources:
                             })
                         }
 
-                # No running job - start a new ingestion job
+                # No running job - check if queue needs purging before starting sync
+                try:
+                    # Check queue attributes to see if there are any messages
+                    queue_attrs = sqs.get_queue_attributes(
+                        QueueUrl=SYNC_QUEUE_URL,
+                        AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesDelayed']
+                    )
+
+                    visible_messages = int(queue_attrs['Attributes'].get('ApproximateNumberOfMessages', 0))
+                    delayed_messages = int(queue_attrs['Attributes'].get('ApproximateNumberOfMessagesDelayed', 0))
+                    total_messages = visible_messages + delayed_messages
+
+                    print(f"Queue status: {visible_messages} visible, {delayed_messages} delayed (total: {total_messages})")
+
+                    # Only purge if there are messages in the queue
+                    if total_messages > 0:
+                        print(f"Purging queue before starting sync (sync will process all bucket objects)")
+                        sqs.purge_queue(QueueUrl=SYNC_QUEUE_URL)
+                        print(f"Queue purged successfully")
+                    else:
+                        print(f"Queue is empty, no purge needed")
+
+                except Exception as queue_error:
+                    print(f"Warning: Error checking/purging queue: {str(queue_error)}")
+                    # Continue with sync even if queue check/purge fails
+
                 print(f"Starting new ingestion job for Knowledge Base {KNOWLEDGE_BASE_ID}")
                 start_response = bedrock_agent.start_ingestion_job(
                     knowledgeBaseId=KNOWLEDGE_BASE_ID,

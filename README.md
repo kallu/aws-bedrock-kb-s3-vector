@@ -160,17 +160,24 @@ S3 Bucket → EventBridge → SQS Queue → Lambda Function → Bedrock Ingestio
    - Batches up to 10 events together
    - This prevents triggering a sync for every single file upload
 
-4. **Lambda Processing**
-   - Lambda receives batch of events from SQS
+4. **Lambda Processing** (Concurrency Limited to 1)
+   - Lambda function limited to single concurrent execution (prevents race conditions)
+   - Receives batch of up to 10 events from SQS
    - Checks if an ingestion job is already running via `list_ingestion_jobs`
 
    **If sync is already running:**
    - Logs: "Ingestion job is IN_PROGRESS"
-   - Sends a **single retry message** to SQS with 5-minute delay
-   - Acknowledges current batch (prevents reprocessing)
+   - Sends a **single retry message** to SQS with 5-minute delay (`DelaySeconds=300`)
+   - Acknowledges current batch (messages auto-deleted on success)
    - This ensures files added during sync are caught in next sync
 
    **If no sync is running:**
+   - Checks queue for pending messages via `get_queue_attributes`
+     - Counts visible messages + delayed messages
+     - Only purges queue if messages exist (avoids SQS 60-second purge cooldown)
+   - **Purges the queue** to remove redundant S3 events and retry messages
+     - Since sync processes ALL bucket objects, individual event messages are redundant
+     - Prevents message accumulation and retry storms
    - Starts new ingestion job via `start_ingestion_job`
    - Returns job ID and status
 
@@ -190,12 +197,45 @@ Upload file3.pdf (time 30s)
 → Single sync triggered at time 60s (if delay = 60s)
 ```
 
-**Collision Prevention**: If sync is running when new files arrive:
-- Current events are acknowledged (removed from queue)
-- Follow-up sync is scheduled for 5 minutes later
-- This prevents duplicate concurrent syncs
+**Queue Purging**: Before starting each sync, the Lambda purges all messages from the queue
+- Bedrock sync processes ALL objects in the bucket, making individual S3 event messages redundant
+- Prevents accumulation of stale messages and retry storms
+- Smart purging: only purges if messages exist (avoids SQS 60-second purge cooldown)
 
-**Retry Strategy**: Failed syncs are automatically retried up to 10 times before moving to DLQ
+**Collision Prevention**: If sync is running when new files arrive:
+- Current batch is acknowledged (messages auto-deleted)
+- Single retry message scheduled with 5-minute delay
+- Concurrency limit (1) ensures only one Lambda execution at a time
+- Prevents duplicate concurrent syncs and race conditions
+
+**Controlled Retry Loop**: Delayed retry messages prevent busy loops
+- While sync runs, new S3 events trigger Lambda (batched every ~60s)
+- Each batch sends one retry message with 5-minute delay (`DelaySeconds=300`)
+- Retry messages don't trigger Lambda until delay expires
+- When retry finally triggers and sync completes, queue is purged and new sync starts
+- Idempotent syncs mean extra syncs are harmless (just redundant)
+
+**Retry Strategy**: Failed Lambda executions are retried up to 10 times before moving to DLQ
+
+### Technical Details
+
+**Why Queue Purging is Safe**:
+- Bedrock's `start_ingestion_job` scans the entire S3 bucket
+- Individual S3 event messages only track which files changed, but sync processes everything anyway
+- Purging before sync ensures no redundant messages accumulate
+- If purge fails (60-second cooldown), sync proceeds anyway (fault-tolerant design)
+
+**Concurrency Control Benefits**:
+- `ReservedConcurrentExecutions: 1` ensures sequential Lambda execution
+- Prevents race condition where two Lambdas might start duplicate syncs
+- Messages queue up in SQS and process one batch at a time
+- Each execution is quick (~100ms for status check, ~1s to start sync)
+
+**Edge Cases Handled**:
+- **Fast syncs (<60s)**: Queue check before purge avoids hitting 60-second cooldown
+- **Purge failure**: Lambda logs warning and continues with sync (graceful degradation)
+- **Sync completes during retry delay**: Next retry triggers new sync (redundant but harmless)
+- **Many files during sync**: Batching (60s window) prevents Lambda spam
 
 ### Monitoring Auto-Sync
 
