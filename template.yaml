@@ -332,14 +332,6 @@ Resources:
   # Auto-Sync Resources
   # ============================================================
 
-  # Dead Letter Queue for failed sync events
-  SyncEventDLQ:
-    Type: AWS::SQS::Queue
-    Condition: AutoSyncEnabled
-    Properties:
-      QueueName: !Sub '${KnowledgeBaseName}-sync-events-dlq'
-      MessageRetentionPeriod: 1209600  # 14 days
-
   # SQS Queue for buffering S3 events
   SyncEventQueue:
     Type: AWS::SQS::Queue
@@ -347,11 +339,8 @@ Resources:
     Properties:
       QueueName: !Sub '${KnowledgeBaseName}-sync-events'
       VisibilityTimeout: 300  # 5 minutes - time for Lambda to process
-      MessageRetentionPeriod: 3600  # 1 hour
+      MessageRetentionPeriod: 86400  # 1 day
       ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt SyncEventDLQ.Arn
-        maxReceiveCount: 10  # Retry up to 10 times before moving to DLQ
 
   # EventBridge Rule to capture S3 events and send to SQS
   S3EventRule:
@@ -458,7 +447,7 @@ Resources:
           Type: SQS
           Properties:
             Queue: !GetAtt SyncEventQueue.Arn
-            BatchSize: 10
+            BatchSize: 100
             MaximumBatchingWindowInSeconds: !Ref AutoSyncDelaySeconds
       InlineCode: |
         import json
@@ -649,13 +638,6 @@ Outputs:
     Value: !Ref SyncEventQueue
     Export:
       Name: !Sub '${AWS::StackName}-SyncEventQueueUrl'
-
-  SyncEventDLQUrl:
-    Condition: AutoSyncEnabled
-    Description: Dead letter queue for failed sync events
-    Value: !Ref SyncEventDLQ
-    Export:
-      Name: !Sub '${AWS::StackName}-SyncEventDLQUrl'
 
   SyncDelaySeconds:
     Condition: AutoSyncEnabled

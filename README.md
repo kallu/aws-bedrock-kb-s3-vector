@@ -27,9 +27,8 @@ Choose from four document chunking strategies:
 When enabled (default), automatically keeps your knowledge base in sync with S3:
 
 - **EventBridge Integration**: Captures S3 object creation and deletion events
-- **SQS Buffering**: Batches multiple file changes with configurable delay (0-300 seconds)
+- **SQS Buffering**: Batches multiple file changes with configurable delay (0-300 seconds), 1-day message retention
 - **Lambda Processor**: Triggers Bedrock ingestion jobs intelligently
-- **Dead Letter Queue**: Captures failed events for troubleshooting
 
 ## Deployment
 
@@ -140,8 +139,6 @@ The auto-sync feature automatically updates your knowledge base when documents a
 
 ```
 S3 Bucket → EventBridge → SQS Queue → Lambda Function → Bedrock Ingestion Job
-                                ↓
-                          Dead Letter Queue (DLQ)
 ```
 
 ### Event Flow
@@ -155,14 +152,14 @@ S3 Bucket → EventBridge → SQS Queue → Lambda Function → Bedrock Ingestio
    - Matched events are sent to SQS queue
 
 3. **SQS Buffering**
-   - SQS accumulates multiple events
+   - SQS accumulates multiple events with 1-day message retention
    - `MaximumBatchingWindowInSeconds` (configurable 0-300s) buffers events
-   - Batches up to 10 events together
+   - Batches up to 100 events together
    - This prevents triggering a sync for every single file upload
 
 4. **Lambda Processing** (Concurrency Limited to 1)
    - Lambda function limited to single concurrent execution (prevents race conditions)
-   - Receives batch of up to 10 events from SQS
+   - Receives batch of up to 100 events from SQS
    - Checks if an ingestion job is already running via `list_ingestion_jobs`
 
    **If sync is already running:**
@@ -180,11 +177,6 @@ S3 Bucket → EventBridge → SQS Queue → Lambda Function → Bedrock Ingestio
      - Prevents message accumulation and retry storms
    - Starts new ingestion job via `start_ingestion_job`
    - Returns job ID and status
-
-5. **Error Handling**
-   - Failed messages are retried up to 10 times
-   - After 10 failures, messages move to Dead Letter Queue (DLQ)
-   - DLQ retains messages for 14 days for troubleshooting
 
 ### Sync Logic Features
 
@@ -214,8 +206,6 @@ Upload file3.pdf (time 30s)
 - Retry messages don't trigger Lambda until delay expires
 - When retry finally triggers and sync completes, queue is purged and new sync starts
 - Idempotent syncs mean extra syncs are harmless (just redundant)
-
-**Retry Strategy**: Failed Lambda executions are retried up to 10 times before moving to DLQ
 
 ### Technical Details
 
@@ -247,16 +237,6 @@ FUNCTION_NAME=$(aws cloudformation describe-stacks \
   --output text | cut -d: -f7)
 
 aws logs tail /aws/lambda/${FUNCTION_NAME} --follow
-```
-
-Check for failed events in DLQ:
-```bash
-DLQ_URL=$(aws cloudformation describe-stacks \
-  --stack-name my-knowledge-base \
-  --query 'Stacks[0].Outputs[?OutputKey==`SyncEventDLQUrl`].OutputValue' \
-  --output text)
-
-aws sqs receive-message --queue-url ${DLQ_URL}
 ```
 
 List recent ingestion jobs:
