@@ -1,0 +1,636 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Bedrock Knowledge Base with S3 data source and S3 Vector storage'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Knowledge Base Configuration'
+        Parameters:
+          - KnowledgeBaseName
+          - ExistingDataSourceBucket
+          - EmbeddingModelId
+      - Label:
+          default: 'Chunking Strategy'
+        Parameters:
+          - ChunkingStrategy
+      - Label:
+          default: 'Fixed-Size Chunking Configuration'
+        Parameters:
+          - FixedSizeMaxTokens
+          - FixedSizeOverlapPercentage
+      - Label:
+          default: 'Hierarchical Chunking Configuration'
+        Parameters:
+          - HierarchicalParentMaxTokens
+          - HierarchicalChildMaxTokens
+          - HierarchicalOverlapTokens
+      - Label:
+          default: 'Semantic Chunking Configuration'
+        Parameters:
+          - SemanticMaxTokens
+          - SemanticBufferSize
+          - SemanticBreakpointPercentileThreshold
+      - Label:
+          default: 'Auto-Sync Configuration'
+        Parameters:
+          - EnableAutoSync
+          - AutoSyncDelaySeconds
+    ParameterLabels:
+      KnowledgeBaseName:
+        default: 'Knowledge Base Name'
+      ExistingDataSourceBucket:
+        default: 'Existing S3 Bucket (Optional)'
+      EmbeddingModelId:
+        default: 'Embedding Model'
+      ChunkingStrategy:
+        default: 'Chunking Strategy'
+      FixedSizeMaxTokens:
+        default: 'Max Tokens per Chunk'
+      FixedSizeOverlapPercentage:
+        default: 'Overlap Percentage'
+      HierarchicalParentMaxTokens:
+        default: 'Parent Chunk Max Tokens'
+      HierarchicalChildMaxTokens:
+        default: 'Child Chunk Max Tokens'
+      HierarchicalOverlapTokens:
+        default: 'Overlap Tokens'
+      SemanticMaxTokens:
+        default: 'Max Tokens per Chunk'
+      SemanticBufferSize:
+        default: 'Buffer Size'
+      SemanticBreakpointPercentileThreshold:
+        default: 'Breakpoint Percentile Threshold'
+      EnableAutoSync:
+        default: 'Enable Auto-Sync'
+      AutoSyncDelaySeconds:
+        default: 'Sync Delay (seconds)'
+
+Parameters:
+  KnowledgeBaseName:
+    Type: String
+    Default: 'MyKnowledgeBase'
+    Description: Name for the Knowledge Base
+
+  ExistingDataSourceBucket:
+    Type: String
+    Default: ''
+    Description: (Optional) Name of existing S3 bucket containing source documents. Leave empty to create a new bucket. If using auto-sync with existing bucket, manually enable EventBridge notifications on the bucket.
+
+  EmbeddingModelId:
+    Type: String
+    Default: 'amazon.titan-embed-text-v2:0'
+    Description: Bedrock embedding model ID
+    AllowedValues:
+      - 'amazon.titan-embed-text-v1'
+      - 'amazon.titan-embed-text-v2:0'
+      - 'cohere.embed-english-v3'
+      - 'cohere.embed-multilingual-v3'
+
+  ChunkingStrategy:
+    Type: String
+    Default: 'SEMANTIC'
+    Description: Strategy for chunking documents
+    AllowedValues:
+      - 'FIXED_SIZE'
+      - 'HIERARCHICAL'
+      - 'SEMANTIC'
+      - 'NONE'
+
+  # Fixed Size Chunking Parameters
+  FixedSizeMaxTokens:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Maximum number of tokens per chunk for fixed-size chunking
+
+  FixedSizeOverlapPercentage:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 99
+    Description: Percentage of overlap between adjacent chunks for fixed-size chunking
+
+  # Hierarchical Chunking Parameters
+  HierarchicalParentMaxTokens:
+    Type: Number
+    Default: 1500
+    MinValue: 1
+    Description: Maximum tokens for parent chunks in hierarchical chunking
+
+  HierarchicalChildMaxTokens:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Maximum tokens for child chunks in hierarchical chunking
+
+  HierarchicalOverlapTokens:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    Description: Number of tokens to overlap between chunks in hierarchical chunking
+
+  # Semantic Chunking Parameters
+  SemanticMaxTokens:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Maximum number of tokens per chunk for semantic chunking
+
+  SemanticBufferSize:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 1
+    Description: Buffer size for semantic chunking (0 or 1)
+
+  SemanticBreakpointPercentileThreshold:
+    Type: Number
+    Default: 95
+    MinValue: 50
+    MaxValue: 99
+    Description: Breakpoint percentile threshold for semantic chunking
+
+  # ============================================================
+  # Auto-Sync Configuration
+  # ============================================================
+  EnableAutoSync:
+    Type: String
+    Default: 'true'
+    Description: Enable automatic sync when S3 documents are added/deleted
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AutoSyncDelaySeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+    Description: Delay in seconds before triggering sync after last S3 change (0-300 seconds)
+
+Conditions:
+  UseFixedSizeChunking: !Equals [!Ref ChunkingStrategy, 'FIXED_SIZE']
+  UseHierarchicalChunking: !Equals [!Ref ChunkingStrategy, 'HIERARCHICAL']
+  UseSemanticChunking: !Equals [!Ref ChunkingStrategy, 'SEMANTIC']
+  UseNoChunking: !Equals [!Ref ChunkingStrategy, 'NONE']
+  AutoSyncEnabled: !Equals [!Ref EnableAutoSync, 'true']
+  CreateNewBucket: !Equals [!Ref ExistingDataSourceBucket, '']
+  UseExistingBucket: !Not [!Equals [!Ref ExistingDataSourceBucket, '']]
+
+Resources:
+  # S3 Bucket for source documents (only created if ExistingDataSourceBucket is not provided)
+  DataSourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewBucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration: !If
+        - AutoSyncEnabled
+        - EventBridgeConfiguration:
+            EventBridgeEnabled: true
+        - !Ref AWS::NoValue
+
+  # S3 Vector Bucket for vector storage
+  VectorStoreBucket:
+    Type: AWS::S3Vectors::VectorBucket
+
+  # Vector Index for the vector bucket
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorStoreBucket.VectorBucketArn
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+
+  # IAM Role for Bedrock Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${KnowledgeBaseName}-KBRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+        - PolicyName: S3DataSourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !If
+                    - CreateNewBucket
+                    - !GetAtt DataSourceBucket.Arn
+                    - !Sub 'arn:aws:s3:::${ExistingDataSourceBucket}'
+                  - !If
+                    - CreateNewBucket
+                    - !Sub '${DataSourceBucket.Arn}/*'
+                    - !Sub 'arn:aws:s3:::${ExistingDataSourceBucket}/*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalAccount': !Ref 'AWS::AccountId'
+        - PolicyName: S3VectorStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3vectors:PutVectors'
+                  - 's3vectors:GetVectors'
+                  - 's3vectors:DeleteVectors'
+                  - 's3vectors:QueryVectors'
+                  - 's3vectors:GetIndex'
+                Resource: !Ref VectorIndex
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+
+  # Bedrock Knowledge Base with S3 Vector Storage
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: VectorIndex
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: Knowledge Base with S3 data source and S3 vector storage
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          VectorBucketArn: !GetAtt VectorStoreBucket.VectorBucketArn
+          IndexArn: !Ref VectorIndex
+
+  # Bedrock Data Source
+  DataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub '${KnowledgeBaseName}-s3-datasource'
+      Description: S3 data source for Knowledge Base
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !If
+            - CreateNewBucket
+            - !GetAtt DataSourceBucket.Arn
+            - !Sub 'arn:aws:s3:::${ExistingDataSourceBucket}'
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: !Ref ChunkingStrategy
+          FixedSizeChunkingConfiguration: !If
+            - UseFixedSizeChunking
+            - MaxTokens: !Ref FixedSizeMaxTokens
+              OverlapPercentage: !Ref FixedSizeOverlapPercentage
+            - !Ref AWS::NoValue
+          HierarchicalChunkingConfiguration: !If
+            - UseHierarchicalChunking
+            - LevelConfigurations:
+                - MaxTokens: !Ref HierarchicalParentMaxTokens
+                - MaxTokens: !Ref HierarchicalChildMaxTokens
+              OverlapTokens: !Ref HierarchicalOverlapTokens
+            - !Ref AWS::NoValue
+          SemanticChunkingConfiguration: !If
+            - UseSemanticChunking
+            - MaxTokens: !Ref SemanticMaxTokens
+              BufferSize: !Ref SemanticBufferSize
+              BreakpointPercentileThreshold: !Ref SemanticBreakpointPercentileThreshold
+            - !Ref AWS::NoValue
+
+  # ============================================================
+  # Auto-Sync Resources
+  # ============================================================
+
+  # Dead Letter Queue for failed sync events
+  SyncEventDLQ:
+    Type: AWS::SQS::Queue
+    Condition: AutoSyncEnabled
+    Properties:
+      QueueName: !Sub '${KnowledgeBaseName}-sync-events-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # SQS Queue for buffering S3 events
+  SyncEventQueue:
+    Type: AWS::SQS::Queue
+    Condition: AutoSyncEnabled
+    Properties:
+      QueueName: !Sub '${KnowledgeBaseName}-sync-events'
+      VisibilityTimeout: 300  # 5 minutes - time for Lambda to process
+      MessageRetentionPeriod: 3600  # 1 hour
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SyncEventDLQ.Arn
+        maxReceiveCount: 10  # Retry up to 10 times before moving to DLQ
+
+  # EventBridge Rule to capture S3 events and send to SQS
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Condition: AutoSyncEnabled
+    Properties:
+      Name: !Sub '${KnowledgeBaseName}-s3-events'
+      Description: Capture S3 object changes for Knowledge Base sync
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+          - Object Deleted
+        detail:
+          bucket:
+            name:
+              - !If
+                - CreateNewBucket
+                - !Ref DataSourceBucket
+                - !Ref ExistingDataSourceBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SyncEventQueue.Arn
+          Id: SyncEventQueueTarget
+
+  # Allow EventBridge to send messages to SQS
+  SyncEventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: AutoSyncEnabled
+    Properties:
+      Queues:
+        - !Ref SyncEventQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SyncEventQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt S3EventRule.Arn
+
+  # IAM Role for Auto-Sync Lambda
+  AutoSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: AutoSyncEnabled
+    Properties:
+      RoleName: !Sub '${KnowledgeBaseName}-AutoSyncLambda'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockIngestionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                  - bedrock:ListIngestionJobs
+                Resource:
+                  - !GetAtt KnowledgeBase.KnowledgeBaseArn
+                  - !Sub '${KnowledgeBase.KnowledgeBaseArn}/*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource: !GetAtt SyncEventQueue.Arn
+
+  # Lambda Function for Auto-Sync
+  AutoSyncFunction:
+    Type: AWS::Serverless::Function
+    Condition: AutoSyncEnabled
+    Properties:
+      FunctionName: !Sub '${KnowledgeBaseName}-AutoSync'
+      Description: Automatically syncs Knowledge Base when S3 documents change
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt AutoSyncLambdaRole.Arn
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBase
+          DATA_SOURCE_ID: !GetAtt DataSource.DataSourceId
+          SYNC_QUEUE_URL: !Ref SyncEventQueue
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SyncEventQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: !Ref AutoSyncDelaySeconds
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        from datetime import datetime, timezone
+
+        bedrock_agent = boto3.client('bedrock-agent')
+        sqs = boto3.client('sqs')
+
+        KNOWLEDGE_BASE_ID = os.environ['KNOWLEDGE_BASE_ID']
+        DATA_SOURCE_ID = os.environ['DATA_SOURCE_ID']
+        SYNC_QUEUE_URL = os.environ['SYNC_QUEUE_URL']
+
+        def lambda_handler(event, context):
+            """
+            Triggered by SQS messages from S3 events via EventBridge.
+            If sync is running, schedule ONE follow-up sync after completion.
+            This ensures files added during sync are caught in the next sync.
+            """
+
+            # Log the batch of events received
+            num_records = len(event.get('Records', []))
+            print(f"Received {num_records} event(s)")
+
+            if num_records == 0:
+                return {'statusCode': 200, 'body': 'No events to process'}
+
+            # Check if there's already an ingestion job running
+            try:
+                response = bedrock_agent.list_ingestion_jobs(
+                    knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                    dataSourceId=DATA_SOURCE_ID,
+                    maxResults=1
+                )
+
+                ingestion_jobs = response.get('ingestionJobSummaries', [])
+
+                if ingestion_jobs:
+                    latest_job = ingestion_jobs[0]
+                    status = latest_job.get('status')
+                    job_id = latest_job.get('ingestionJobId')
+
+                    print(f"Latest ingestion job {job_id} status: {status}")
+
+                    # If sync is running, schedule ONE follow-up sync
+                    if status in ['STARTING', 'IN_PROGRESS']:
+                        print(f"Ingestion job {job_id} is {status}.")
+                        print(f"Scheduling follow-up sync to catch files added during current sync.")
+
+                        # Send a retry message to trigger sync after current job completes
+                        # Multiple retry messages are OK - they'll collapse into one sync
+                        sqs.send_message(
+                            QueueUrl=SYNC_QUEUE_URL,
+                            MessageBody=json.dumps({
+                                'type': 'retry',
+                                'reason': 'sync_in_progress',
+                                'jobId': job_id,
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }),
+                            DelaySeconds=300  # Retry after 5 minutes
+                        )
+
+                        print(f"Follow-up sync scheduled. Current messages acknowledged.")
+                        return {
+                            'statusCode': 200,
+                            'body': json.dumps({
+                                'message': 'Sync deferred - follow-up scheduled',
+                                'jobId': job_id,
+                                'status': status,
+                                'eventsAcknowledged': num_records
+                            })
+                        }
+
+                # No running job - start a new ingestion job
+                print(f"Starting new ingestion job for Knowledge Base {KNOWLEDGE_BASE_ID}")
+                start_response = bedrock_agent.start_ingestion_job(
+                    knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                    dataSourceId=DATA_SOURCE_ID,
+                    description=f"Auto-sync triggered at {datetime.now(timezone.utc).isoformat()}"
+                )
+
+                new_job_id = start_response['ingestionJob']['ingestionJobId']
+                new_status = start_response['ingestionJob']['status']
+
+                print(f"Successfully started ingestion job {new_job_id} with status {new_status}")
+
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Sync started successfully',
+                        'jobId': new_job_id,
+                        'status': new_status,
+                        'eventsProcessed': num_records
+                    })
+                }
+
+            except Exception as e:
+                print(f"Error managing ingestion job: {str(e)}")
+                raise
+
+Outputs:
+  KnowledgeBaseId:
+    Description: Knowledge Base ID
+    Value: !Ref KnowledgeBase
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseId'
+
+  KnowledgeBaseArn:
+    Description: Knowledge Base ARN
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseArn'
+
+  DataSourceId:
+    Description: Data Source ID
+    Value: !Ref DataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSourceId'
+
+  DataSourceBucketName:
+    Description: S3 bucket name for source documents
+    Value: !If
+      - CreateNewBucket
+      - !Ref DataSourceBucket
+      - !Ref ExistingDataSourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSourceBucket'
+
+  DataSourceBucketCreated:
+    Description: Whether a new bucket was created (true) or existing bucket was used (false)
+    Value: !If
+      - CreateNewBucket
+      - 'true'
+      - 'false'
+
+  VectorStoreBucketName:
+    Description: S3 bucket name for vector storage
+    Value: !Ref VectorStoreBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-VectorStoreBucket'
+
+  BedrockKnowledgeBaseRoleArn:
+    Description: IAM Role ARN for Knowledge Base
+    Value: !GetAtt BedrockKnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  AutoSyncEnabled:
+    Description: Whether auto-sync is enabled
+    Value: !Ref EnableAutoSync
+
+  AutoSyncFunctionArn:
+    Condition: AutoSyncEnabled
+    Description: Auto-sync Lambda function ARN
+    Value: !GetAtt AutoSyncFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoSyncFunctionArn'
+
+  SyncEventQueueUrl:
+    Condition: AutoSyncEnabled
+    Description: SQS queue URL for sync events
+    Value: !Ref SyncEventQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-SyncEventQueueUrl'
+
+  SyncEventDLQUrl:
+    Condition: AutoSyncEnabled
+    Description: Dead letter queue for failed sync events
+    Value: !Ref SyncEventDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-SyncEventDLQUrl'
+
+  SyncDelaySeconds:
+    Condition: AutoSyncEnabled
+    Description: Configured delay before sync triggers
+    Value: !Ref AutoSyncDelaySeconds
